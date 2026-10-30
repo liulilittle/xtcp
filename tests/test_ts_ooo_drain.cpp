@@ -1,19 +1,13 @@
 /**
  * @file test_ts_ooo_drain.cpp
- * @brief RFC 7323 s3.4: TsRecent is the TSval of the LAST in-order
- *        segment - a segment drained from the out-of-order buffer becomes
- *        in-order, so its TSval must advance TsRecent (the PAWS anchor and
- *        the tsecr echo source). The pre-fix code only anchored on
- *        directly-in-order segments, leaving the anchor behind after
- *        reassembly (the closing-state drain path did anchor - the
- *        established path did not).
+ * @brief RFC 7323 s4.3(C): echo the timestamp of the segment filling
+ *        the hole, without replacing it with a cached OOO timestamp.
  *
- * The stack's own data segments carry no TSopt by design, so the
- * out-of-order-drain anchor only engages for a timestamped peer (Linux
- * sends TSopt on every data segment). This test hand-builds two
- * timestamped data segments: segment 2 delivered out of order (buffered),
+ * After a live handshake, this test hand-builds two timestamped peer
+ * data segments: segment 2 delivered out of order (buffered),
  * then segment 1 (in-order, drains segment 2). The receiver's ACK must
- * echo tsecr == segment 2's TSval.
+ * echo tsecr == segment 1's TSval. A subsequent stale segment must still
+ * fail PAWS in established and closing states.
  */
 
 #include <xtcp/buf/bufref.h>
@@ -103,7 +97,7 @@ namespace {
     // frame in out (out_cap bytes). seq/ack/ts fields as given; payload
     // filled with 0x5E. IP src/dst/ports match the established connection.
     UInt32 BuildTsSegment(Byte* out, UInt32 out_cap, UInt32 seq, UInt32 ack,
-                          UInt32 ts_val, UInt32 ts_ecr, UInt32 payload_len) {
+                          UInt32 ts_val, UInt32 ts_ecr, UInt32 payload_len, Byte flags = 0x18) {
         const UInt32 tcp_hdr = 20 + 12;  // base + TSopt
         const UInt32 total = 20 + tcp_hdr + payload_len;
         if (out_cap < total) {
@@ -125,7 +119,7 @@ namespace {
         t[8] = static_cast<Byte>(ack >> 24); t[9] = static_cast<Byte>(ack >> 16);
         t[10] = static_cast<Byte>(ack >> 8); t[11] = static_cast<Byte>(ack & 0xFF);
         t[12] = static_cast<Byte>(tcp_hdr / 4 << 4);  // data offset
-        t[13] = 0x18;  // ACK|PSH
+        t[13] = flags;  // ACK|PSH by default; pure FIN uses ACK|FIN.
         t[14] = 0xFF; t[15] = 0xFF;  // window
         // TSopt (kind 8, len 10).
         t[20] = 8; t[21] = 10;
@@ -161,8 +155,7 @@ namespace {
 
 }  // namespace
 
-int main() {
-    xtcp::buf::InitPools();
+static void RunCase(bool closing) {
     {
         xtcp::ndi::ManualBackend backend_a, backend_b;
         xtcp::XtcpStack stack_a(&backend_a);
@@ -180,24 +173,57 @@ int main() {
             stack_b.OnPacket(std::move(buf));
         });
 
+        UInt64 server_conn = 0;
+        stack_b.SetAcceptHandler([&](UInt64 id, const xtcp::core::Endpoint&, const xtcp::core::Endpoint&) {
+            server_conn = id;
+            return true;
+        });
         std::atomic<UInt64> b_recv{0};
-        stack_b.SetRecvHandler([&b_recv](UInt64, const Byte*, UInt32 len) {
+        stack_b.SetRecvHandlerChecked([&](UInt64, const Byte*, UInt32 len) {
             b_recv.fetch_add(len, std::memory_order_relaxed);
             return true;
         });
 
+        // tsecr of every timestamped B->A segment. A gap-filling segment is
+        // ACKed immediately, so pump() forwards that ACK before the caller
+        // can poll B's queue; record it here.
+        std::vector<UInt32> b_ecrs;
+        UInt32 client_last_tsval = 0;
+        bool client_tsval_seen = false;
+        UInt32 client_ack = 0;
+        UInt32 frontier = 0;
+        bool probe_acked = false;
+        bool synthetic_peer = false;
         auto pump = [&]() {
             Byte out[65536];
             while (0 != backend_a.TxPending()) {
                 const UInt32 n = backend_a.PollTx(out);
                 if (0 < n) {
+                    const Byte* t = out + 20;
+                    client_ack = (UInt32(t[8]) << 24) | (UInt32(t[9]) << 16) |
+                                 (UInt32(t[10]) << 8) | UInt32(t[11]);
+                    const TsInfo ts = ParseTs(out);
+                    if (ts.has) {
+                        client_last_tsval = ts.ts_val;
+                        client_tsval_seen = true;
+                    }
                     backend_b.Inject(out, n, 0x0800);
                 }
             }
             while (0 != backend_b.TxPending()) {
                 const UInt32 n = backend_b.PollTx(out);
                 if (0 < n) {
-                    backend_a.Inject(out, n, 0x0800);
+                    if (b_recv.load() == 1) {
+                        const Byte* t = out + 20;
+                        frontier = (UInt32(t[8]) << 24) | (UInt32(t[9]) << 16) |
+                                   (UInt32(t[10]) << 8) | UInt32(t[11]);
+                        probe_acked = true;
+                    }
+                    const TsInfo ts = ParseTs(out);
+                    if (ts.has) {
+                        b_ecrs.push_back(ts.ts_ecr);
+                    }
+                    if (!synthetic_peer) backend_a.Inject(out, n, 0x0800);
                 }
             }
             stack_a.PollAckTimers();
@@ -224,32 +250,35 @@ int main() {
         // field is rcv_nxt.
         const Byte one = 0x01;
         CHECK(stack_a.Send(conn, &one, 1));
-        UInt32 frontier = 0;
-        for (UInt32 i = 0; i < 200 && 0 == frontier; ++i) {
+        for (UInt32 i = 0; i < 200 && !probe_acked; ++i) {
             pump();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            while (0 != backend_b.TxPending()) {
-                Byte out[65536];
-                const UInt32 n = backend_b.PollTx(out);
-                if (40 <= n) {
-                    const Byte* t = out + 20;
-                    frontier = (static_cast<UInt32>(t[8]) << 24) |
-                               (static_cast<UInt32>(t[9]) << 16) |
-                               (static_cast<UInt32>(t[10]) << 8) |
-                               static_cast<UInt32>(t[11]);
-                }
-            }
         }
-        CHECK(0 != frontier);
+        CHECK(probe_acked);
+        CHECK(server_conn != 0);
+        if (!probe_acked || !server_conn) return;
         std::fprintf(stderr, "[ts-ooo-drain] frontier=%08X\n", frontier);
+        if (closing) {
+            stack_b.Close(server_conn);
+            for (unsigned i = 0; i < 20; ++i) pump();
+            CHECK(stack_b.ConnectionState(server_conn) == xtcp::core::TcpState::kFinWait2);
+        }
+        synthetic_peer = true;
 
         // Segment 2 (seq = frontier + 1460) delivered FIRST: buffered as
         // out-of-order, nothing reaches the app.
-        const UInt32 kTs1 = 0x10000001u, kTs2 = 0x10000002u;
         const UInt32 kPayload = 1460;
+        CHECK(client_tsval_seen);
+        // Keep synthetic peer timestamps newer than the actual handshake and
+        // probe timestamps so PAWS does not discard the test data on hosts
+        // whose monotonic clock has already passed the old fixed TSval.
+        // The hole is filled by a newer retransmission. Draining the older
+        // cached segment must neither change the echo nor lower PAWS.
+        const UInt32 kTs1 = client_last_tsval + 3;
+        const UInt32 kTs2 = client_last_tsval + 2;
         Byte frame[2048];
         const UInt32 n2 = BuildTsSegment(frame, sizeof(frame), frontier + kPayload,
-                                         0, kTs2, 0, kPayload);
+                                         client_ack, kTs2, 0, kPayload);
         CHECK(0 != n2);
         {
             xtcp::buf::BufRef b = xtcp::buf::BufRef::Acquire(n2);
@@ -265,9 +294,9 @@ int main() {
         CHECK(1 == b_recv.load());  // only the 1-byte probe; OOO segment buffered
 
         // Segment 1 (seq = frontier): in-order; the app receives both
-        // (segment 2 via the drain). The drain must anchor TsRecent to
-        // segment 2's TSval (kTs2).
-        const UInt32 n1 = BuildTsSegment(frame, sizeof(frame), frontier, 0, kTs1, 0, kPayload);
+        // (segment 2 via the drain). The echo must retain kTs1.
+        b_ecrs.clear();
+        const UInt32 n1 = BuildTsSegment(frame, sizeof(frame), frontier, client_ack, kTs1, 0, kPayload);
         CHECK(0 != n1);
         {
             xtcp::buf::BufRef b = xtcp::buf::BufRef::Acquire(n1);
@@ -282,29 +311,56 @@ int main() {
         }
         CHECK(1 + 2 * kPayload == b_recv.load());  // probe + both segments delivered
 
-        // The server's ACK must echo tsecr == kTs2 (the drained segment
-        // advanced TsRecent). delayed-ACK (40ms) needs real time.
+        // The server's first ACK after the drain must echo tsecr == kTs1.
+        // A delayed ACK needs real
+        // time, so keep pumping until one is observed.
         UInt32 ack_ecr = 0;
         bool ack_seen = false;
         for (UInt32 i = 0; i < 300 && !ack_seen; ++i) {
-            while (0 != backend_b.TxPending()) {
-                Byte out[65536];
-                backend_b.PollTx(out);
-                const TsInfo ts = ParseTs(out);
-                if (ts.has) {
-                    ack_ecr = ts.ts_ecr;
-                    ack_seen = true;
-                    break;
-                }
+            if (!b_ecrs.empty()) {
+                ack_ecr = b_ecrs.front();
+                ack_seen = true;
+                break;
             }
-            if (!ack_seen) {
-                pump();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+            pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         CHECK(ack_seen);
-        std::fprintf(stderr, "[ts-ooo-drain] ACK tsecr=%08X expected=%08X\n", ack_ecr, kTs2);
-        CHECK(ack_ecr == kTs2);  // the drained segment anchored TsRecent
+        std::fprintf(stderr, "[ts-ooo-drain] closing=%d ACK tsecr=%08X expected=%08X\n", closing, ack_ecr, kTs1);
+        CHECK(ack_ecr == kTs1);
+        auto inject = [&](UInt32 ts) {
+            const UInt32 n = BuildTsSegment(frame, sizeof(frame), frontier + 2 * kPayload,
+                                            client_ack, ts, 0, 1);
+            backend_b.Inject(frame, n, 0x0800);
+            pump();
+        };
+        inject(kTs2);  // Older than the gap-filler: must fail PAWS.
+        CHECK(b_recv.load() == 1 + 2 * kPayload);
+        inject(kTs1 + 1);
+        CHECK(b_recv.load() == 2 + 2 * kPayload);
+        auto inject_fin = [&](UInt32 ts) {
+            const UInt32 n = BuildTsSegment(frame, sizeof(frame), frontier + 2 * kPayload + 1,
+                                            client_ack, ts, 0, 0, 0x11);
+            CHECK(n != 0);
+            backend_b.Inject(frame, n, 0x0800);
+            pump();
+        };
+        const auto before_fin = stack_b.ConnectionState(server_conn);
+        inject_fin(kTs2);
+        CHECK(stack_b.ConnectionState(server_conn) == before_fin);
+        b_ecrs.clear();
+        inject_fin(kTs1 + 2);
+        CHECK(stack_b.ConnectionState(server_conn) == (closing
+            ? xtcp::core::TcpState::kTimeWait : xtcp::core::TcpState::kCloseWait));
+        CHECK(!b_ecrs.empty());
+        if (!b_ecrs.empty()) CHECK(b_ecrs.back() == kTs1 + 2);
+    }
+}
+
+int main() {
+    xtcp::buf::InitPools();
+    for (bool closing : {false, true}) {
+        RunCase(closing);
     }
     xtcp::buf::ShutdownPools();
     std::fprintf(stderr, g_failures ? "TS_OOO_DRAIN: FAILED (%d)\n" : "TS_OOO_DRAIN: ALL PASSED\n", g_failures);

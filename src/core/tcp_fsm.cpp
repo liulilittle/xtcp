@@ -2327,12 +2327,7 @@ namespace xtcp {
                     }
                     const UInt32 prev_drain = rcv_nxt_;
                     rcv_nxt_ += static_cast<UInt32>(seg.data.size());  // advance before callback
-                    // RFC 7323: the drained segment is now in-order - its
-                    // TSval advances TsRecent (the PAWS anchor).
-                    if (0 != seg.ts_val) {
-                        ts_recent_ = seg.ts_val;
-                            ts_recent_stamp_ = static_cast<UInt32>((now / 1000) & 0xFFFFFFFF);
-                    }
+                    // RFC 7323 4.3(C): retain the hole-filler's timestamp.
                     if (recv_cb_ && !recv_cb_(seg.data.data(), static_cast<UInt32>(seg.data.size()))) {
                         // Backpressure: drop this buffered segment (refund its
                         // bytes) and stop draining; the peer retransmits.
@@ -5979,7 +5974,7 @@ namespace xtcp {
             // every consumer already treats as "no options".
             TcpOpts opts;
             const bool opts_parsed = ParseTcpOpts(data, len, hdr.hdr_len, opts);
-            if (timestamps_ok_ && 0 < payload_len && opts_parsed && opts.has_timestamp) {
+            if (timestamps_ok_ && (0 < payload_len || hdr.IsFin()) && opts_parsed && opts.has_timestamp) {
                 const bool paws_state = TcpState::kEstablished == state_ ||
                     TcpState::kFinWait1 == state_ || TcpState::kFinWait2 == state_ ||
                     TcpState::kClosing == state_ || TcpState::kCloseWait == state_ ||
@@ -5987,6 +5982,13 @@ namespace xtcp {
                 if (paws_state && SeqLt(opts.ts_val, ts_recent_) &&
                     kPawsMaxIdleMs > static_cast<UInt32>((now / 1000) - ts_recent_stamp_)) {
                     return;  // stale: drop (RFC 7323 s5.3 R1; s5.5 relaxes after a 24-day idle)
+                }
+                // Anchor on arrival of the frontier segment, including in
+                // closing states. Never re-anchor while draining cached data
+                // or resuming delivery after application backpressure.
+                if (paws_state && hdr.seq == rcv_nxt_ && !hdr.IsRst() && !hdr.IsSyn()) {
+                    ts_recent_ = opts.ts_val;
+                    ts_recent_stamp_ = static_cast<UInt32>((now / 1000) & 0xFFFFFFFF);
                 }
             }
 
@@ -6458,13 +6460,6 @@ namespace xtcp {
                 }
                 if (payload_len > 0 || hdr.IsFin()) {
                     if (hdr.seq == rcv_nxt_) {
-                        // RFC 7323: TsRecent = the TSval of the accepted
-                        // in-order segment (the PAWS anchor + the tsecr
-                        // source for our ACKs).
-                        if (timestamps_ok_ && opts_parsed && opts.has_timestamp) {
-                            ts_recent_ = opts.ts_val;
-                            ts_recent_stamp_ = static_cast<UInt32>((now / 1000) & 0xFFFFFFFF);
-                        }
                         // RFC 793 urgent data (SO_OOBINLINE): the URG flag
                         // marks the segment - the app is notified once, the
                         // urgent bytes ride the normal stream.
@@ -6518,13 +6513,7 @@ namespace xtcp {
                             const OutSeg& seg = it->second;
                             const UInt32 prev_drain = rcv_nxt_;
                             rcv_nxt_ += static_cast<UInt32>(seg.data.size());  // advance before callback (piggyback ACK)
-                            // RFC 7323: the drained segment is now in-order -
-                            // its TSval advances TsRecent (the PAWS anchor),
-                            // mirroring the closing-state drain path.
-                            if (0 != seg.ts_val) {
-                                ts_recent_ = seg.ts_val;
-                                ts_recent_stamp_ = static_cast<UInt32>((now / 1000) & 0xFFFFFFFF);
-                            }
+                            // RFC 7323 4.3(C): retain the hole-filler's timestamp.
                             if (!seg.data.empty() && recv_cb_ && !recv_cb_(seg.data.data(), static_cast<UInt32>(seg.data.size()))) {
                                 // Backpressure: drop this buffered segment
                                 // (refund its bytes) and stop draining; the
