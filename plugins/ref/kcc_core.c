@@ -174,6 +174,12 @@ struct kcc_core {
 	u32  prev_ca_state;
 	u32  prior_cwnd;
 	u32  packet_conservation;
+	/* Linux tcp_bbr.c ack-aggregation estimator (packet domain). */
+	u64  extra_acked[2];
+	u64  ack_epoch_mstamp_us;
+	u64  ack_epoch_acked;
+	u32  extra_acked_win_rtts;
+	u32  extra_acked_win_idx;
 
 	/* Kernel sk->sk_max_pacing_rate: the ceiling kcc_bw_to_pacing_rate
 	 * applies to every rate it produces (tcp_kcc.c:3563-3567). ~0 = none,
@@ -227,6 +233,53 @@ struct kcc_snapshot {
 };
 
 static u64 kcc_min_u64(u64 a, u64 b) { return a < b ? a : b; }
+
+/* Linux bbr_update_ack_aggregation / bbr_ack_aggregation_cwnd in the packet
+ * domain; mirrors the C++ port's UpdateAckAggregation/AckAggregationCwnd. */
+static void kcc_update_ack_aggregation(struct kcc_core *k, u64 acked, u64 now_us,
+				       int round_start) {
+	u64 epoch_us;
+	u64 expected_acked = 0;
+	u64 extra;
+
+	if (acked == 0) return;
+	if (round_start) {
+		if (k->extra_acked_win_rtts < 0x1F) k->extra_acked_win_rtts++;
+		if (k->extra_acked_win_rtts >= 5) {
+			k->extra_acked_win_rtts = 0;
+			k->extra_acked_win_idx = k->extra_acked_win_idx ? 0 : 1;
+			k->extra_acked[k->extra_acked_win_idx] = 0;
+		}
+	}
+	epoch_us = (now_us > k->ack_epoch_mstamp_us) ? now_us - k->ack_epoch_mstamp_us : 0;
+	if (k->max_bw != 0 && epoch_us != 0) {
+		u64 bw = (u64)k->max_bw;
+		expected_acked = (epoch_us > (~(u64)0) / bw)
+			? ((~(u64)0) >> 24) : ((bw * epoch_us) >> 24);
+	}
+	if (k->ack_epoch_acked <= expected_acked ||
+	    k->ack_epoch_acked + acked >= (1u << 20)) {
+		k->ack_epoch_acked = 0;
+		k->ack_epoch_mstamp_us = now_us;
+		expected_acked = 0;
+	}
+	k->ack_epoch_acked += acked;
+	if (k->ack_epoch_acked > 0xFFFFFu) k->ack_epoch_acked = 0xFFFFFu;
+	extra = (k->ack_epoch_acked > expected_acked) ? k->ack_epoch_acked - expected_acked : 0;
+	if (extra > (u64)k->cwnd_segs) extra = (u64)k->cwnd_segs;
+	if (extra > k->extra_acked[k->extra_acked_win_idx])
+		k->extra_acked[k->extra_acked_win_idx] = extra;
+}
+
+static u64 kcc_ack_aggregation_cwnd(const struct kcc_core *k) {
+	u64 max_aggr;
+	u64 extra;
+	if (!k->full_bw_reached) return 0;
+	max_aggr = ((u64)k->max_bw * 100000ull) >> 24;
+	extra = k->extra_acked[0] > k->extra_acked[1] ? k->extra_acked[0] : k->extra_acked[1];
+	extra = (256ull * extra) >> 8;
+	return extra < max_aggr ? extra : max_aggr;
+}
 static u32 kcc_max_u32(u32 a, u32 b) { return a > b ? a : b; }
 
 /* SplitMix32: must match the port exactly for the differential oracle. */
@@ -788,6 +841,8 @@ static void kcc_update_model(struct kcc_core *k, const struct kcc_ack_input *in)
 		kcc_bw_update(k, bw, k->rtt_cnt);
 	}
 	k->max_bw = kcc_bw_max(k);
+	kcc_update_ack_aggregation(k, (u64)(delivered > 0 ? delivered : 0), (u64)now_us,
+				   round_start);
 
 	/* Kernel kcc_is_next_cycle_phase measures rs->prior_in_flight (the
 	 * in-flight snapshot taken BEFORE this ACK cleaned the queue). */
@@ -936,6 +991,10 @@ static void kcc_set_cwnd(struct kcc_core *k, u64 bw, s32 gain, s64 acked,
 	if (!conserve && acked > 0) {
 		if (k->min_rtt_us != MIN_RTT_UNINIT && k->min_rtt_us > 0) {
 			u64 target = kcc_bdp_packets(bw, k->min_rtt_us, (u32)gain);
+			/* Linux bbr_set_cwnd: + ack_aggregation_cwnd, then
+			 * quantization budget (mirrors the C++ port). */
+			target += kcc_ack_aggregation_cwnd(k);
+			target = kcc_quantization_budget(target, kcc_tso_segs_goal(k));
 			if (k->mode == KCC_MODE_PROBE_BW && k->cycle_idx == 0) {
 				target += 2;  /* KCC_PROBE_CWND_BONUS (segs) */
 			}

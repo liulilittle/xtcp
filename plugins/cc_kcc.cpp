@@ -259,6 +259,16 @@ namespace {
         Byte    packet_conservation = 0;
         /** @brief Kernel kcc->prior_cwnd, kept in the CC-private state too. */
         UInt32  prior_cwnd = 0;
+        /**
+         * @brief ACK-aggregation estimator (Linux tcp_bbr.c
+         *        bbr_update_ack_aggregation): max packets ACKed beyond what
+         *        max_bw predicts over an ACK epoch, two-slot windowed max.
+         */
+        UInt64  extra_acked[2] = {0, 0};
+        UInt64  ack_epoch_mstamp_us = 0;
+        UInt64  ack_epoch_acked = 0;
+        Byte    extra_acked_win_rtts = 0;
+        Byte    extra_acked_win_idx = 0;
 
         UInt64 BwMax() const noexcept {
             if (0 == bw_sample_count) {
@@ -855,6 +865,77 @@ namespace {
                (elapsed > static_cast<UInt64>(k->min_rtt_us) * 4);
     }
 
+    // Linux tcp_bbr.c ack-aggregation constants.
+    constexpr Byte   kExtraAckedWinRtts = 5;          /* bbr_extra_acked_win_rtts */
+    constexpr UInt64 kAckEpochAckedResetThresh = 1u << 20;
+    constexpr UInt32 kExtraAckedGain = 256;           /* bbr_extra_acked_gain (BBR_UNIT) */
+    constexpr UInt64 kExtraAckedMaxUs = 100u * 1000u; /* bbr_extra_acked_max_us */
+
+    /**
+     * @brief Linux bbr_update_ack_aggregation, packet domain.
+     *
+     * OpenPPP2 delivers the peer's ACKs in batches (one strand drain per
+     * GRO/ingress burst), so the ACK clock is aggregated far beyond the
+     * min_rtt the BDP is built from. Without this term (and the
+     * quantization budget) the KCC v2 cwnd is clamped to
+     * cwnd_gain * max_bw * min_rtt - a few packets when min_rtt is tens of
+     * microseconds - and throughput collapses to cwnd / (aggregated RTT).
+     */
+    void UpdateAckAggregation(KccState* k, UInt64 acked, UInt64 now_us,
+                              bool round_start, UInt32 snd_cwnd) noexcept {
+        if (0 == acked) {
+            return;
+        }
+        if (round_start) {
+            if (k->extra_acked_win_rtts < 0x1F) {
+                ++k->extra_acked_win_rtts;
+            }
+            if (k->extra_acked_win_rtts >= kExtraAckedWinRtts) {
+                k->extra_acked_win_rtts = 0;
+                k->extra_acked_win_idx = k->extra_acked_win_idx ? 0 : 1;
+                k->extra_acked[k->extra_acked_win_idx] = 0;
+            }
+        }
+        const UInt64 epoch_us = (now_us > k->ack_epoch_mstamp_us)
+            ? (now_us - k->ack_epoch_mstamp_us) : 0;
+        UInt64 expected_acked = 0;
+        if (0 != k->max_bw && 0 != epoch_us) {
+            const UInt64 bw = k->max_bw;
+            expected_acked = (epoch_us > (~UInt64(0)) / bw)
+                ? (~UInt64(0) >> 24) : ((bw * epoch_us) >> 24);
+        }
+        if (k->ack_epoch_acked <= expected_acked ||
+            k->ack_epoch_acked + acked >= kAckEpochAckedResetThresh) {
+            k->ack_epoch_acked = 0;
+            k->ack_epoch_mstamp_us = now_us;
+            expected_acked = 0;
+        }
+        k->ack_epoch_acked += acked;
+        if (k->ack_epoch_acked > 0xFFFFFu) {
+            k->ack_epoch_acked = 0xFFFFFu;
+        }
+        UInt64 extra = (k->ack_epoch_acked > expected_acked)
+            ? (k->ack_epoch_acked - expected_acked) : 0;
+        if (extra > snd_cwnd) {
+            extra = snd_cwnd;
+        }
+        if (extra > k->extra_acked[k->extra_acked_win_idx]) {
+            k->extra_acked[k->extra_acked_win_idx] = extra;
+        }
+    }
+
+    /** @brief Linux bbr_ack_aggregation_cwnd, packet domain. */
+    UInt64 AckAggregationCwnd(const KccState* k) noexcept {
+        if (0 == k->full_bw_reached) {
+            return 0;
+        }
+        const UInt64 max_aggr = (k->max_bw * kExtraAckedMaxUs) >> 24;
+        const UInt64 extra = (k->extra_acked[0] > k->extra_acked[1])
+            ? k->extra_acked[0] : k->extra_acked[1];
+        UInt64 aggr = (kExtraAckedGain * extra) >> 8;
+        return (aggr < max_aggr) ? aggr : max_aggr;
+    }
+
     void KccInit(XtcpConnCc* sk) noexcept {
         KccState* k = Priv(sk);
         if (NULLPTR == k) {
@@ -901,6 +982,12 @@ namespace {
         k->prev_ca_state = 0;
         k->packet_conservation = 0;
         k->prior_cwnd = 0;
+        k->extra_acked[0] = 0;
+        k->extra_acked[1] = 0;
+        k->ack_epoch_mstamp_us = 0;
+        k->ack_epoch_acked = 0;
+        k->extra_acked_win_rtts = 0;
+        k->extra_acked_win_idx = 0;
 
         k->mode = kModeStartup;
         k->pacing_gain = kHighGain;
@@ -970,6 +1057,7 @@ namespace {
             k->BwUpdate(bw, k->rtt_cnt);
         }
         k->max_bw = k->BwMax();
+        UpdateAckAggregation(k, acked, now_us, round_start, sk->snd_cwnd);
 
         // ---- 2. PROBE_BW cycle phase (before gains) ----
         if (kModeProbeBw == k->mode && IsNextCyclePhase(k, sk, rs, now_us)) {
@@ -1118,7 +1206,15 @@ namespace {
         if (!conserve && 0 < acked) {
             if (k->min_rtt_us != kMinRttUninit && 0 < k->min_rtt_us) {
                 // Raw max_bw (only the pacing path floors to BW_UNIT).
+                // Linux bbr_set_cwnd: target = bdp + ack_aggregation_cwnd,
+                // then bbr_quantization_budget (TSO headroom). KCC v2 kept
+                // only the bare BDP here (it already uses the quantization
+                // budget for the DRAIN gate), which pins cwnd at a handful
+                // of packets on a tiny-min_rtt path whose ACKs are batched.
                 UInt64 target = BdpPackets(k->max_bw, k->min_rtt_us, k->cwnd_gain);
+                target += AckAggregationCwnd(k);
+                target = QuantizationBudget(
+                    target, TsoSegsGoal(k, sk->mss, sk->pacing_rate));
                 if (kModeProbeBw == k->mode && 0 == k->cycle_idx) {
                     target += kCwndProbeBonus;
                 }

@@ -4290,8 +4290,12 @@ namespace {
             CHECK(0u == pre.full_bw_reached);
             CHECK(1u == pre.packet_conservation);
             CHECK(3u == pre.prev_ca_state);
-            const UInt64 restore_target =
-                kcc_bdp_packets(pre.max_bw, pre.min_rtt_us, pre.cwnd_gain);
+            // The cwnd target is the BDP plus the quantization budget
+            // (Linux bbr_set_cwnd -> bbr_quantization_budget); ack
+            // aggregation is still 0 because full_bw is not reached.
+            const UInt64 restore_target = kcc_quantization_budget(
+                kcc_bdp_packets(pre.max_bw, pre.min_rtt_us, pre.cwnd_gain),
+                kcc_tso_segs_goal(&r.ref));
             CHECK(6 < restore_target);
             CHECK(restore_target <= 0xFFFFFFFFull);
             r.sk.snd_cwnd = 6;
