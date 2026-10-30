@@ -4,6 +4,8 @@
  */
 
 #include <xtcp/core/shard.h>
+#include <xtcp/core/stack.h>
+#include <xtcp/ndi/manual.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -102,11 +104,45 @@ static void TestPoolAndTimers() {
     CHECK(fired);
 }
 
+static void TestOutgoingPacketShard() {
+    xtcp::buf::InitPools();
+    {
+        xtcp::ndi::ManualBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        for (Byte family : {Byte(4), Byte(6)}) {
+            for (UInt16 i = 0; i < 64; ++i) {
+                xtcp::core::Endpoint local, remote;
+                local.family = remote.family = family;
+                local.addr[0] = family == 4 ? 0xC0A80102 : 0x20010DB8;
+                remote.addr[0] = family == 4 ? 0x0A000001 : 0x20010DB8;
+                if (family == 6) {
+                    local.addr[3] = 1 + i;
+                    remote.addr[3] = 1000 + i;
+                }
+                local.port = 40000 + i;
+                remote.port = 443;
+                const UInt64 id = stack.Connect(local, remote);
+                CHECK(id != 0);
+                Byte bytes[256];
+                xtcp::ndi::Packet packet;
+                packet.data = bytes;
+                packet.len = backend.PollTx(bytes);
+                CHECK(packet.len >= 40);
+                // TX source is local; reversing the tuple selects the
+                // receiver's shard and misattributes DMA/qdisc retries.
+                if (packet.len >= 40) CHECK(stack.ShardOfPacket(packet) == stack.ShardOf(id));
+            }
+        }
+    }
+    xtcp::buf::ShutdownPools();
+}
+
 int main() {
     TestAddLookupRemove();
     TestChurn100k();
     TestFamilyIsolation();
     TestPoolAndTimers();
+    TestOutgoingPacketShard();
     if (0 < g_failures) {
         std::fprintf(stderr, "test_shard: %d failure(s)\n", g_failures);
         return 1;

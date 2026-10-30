@@ -932,7 +932,9 @@ namespace xtcp {
         const Byte* t = p.data + tcp_off;
         src.port = static_cast<UInt16>((t[0] << 8) | t[1]);
         dst.port = static_cast<UInt16>((t[2] << 8) | t[3]);
-        return ShardOf(KeyOf(dst, src));
+        // This helper routes TX retries: source is our local endpoint.
+        // OnPacket reverses the wire tuple for RX; TX must not reverse it.
+        return ShardOf(KeyOf(src, dst));
     }
 
     bool XtcpStack::SetOption(UInt64 conn_id, options::SocketOption opt,
