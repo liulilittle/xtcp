@@ -443,8 +443,6 @@ namespace xtcp {
                 return static_cast<UInt16>(~sum & 0xFFFF);
             }
 
-
-
             /**
              * @brief Builds a complete IPv4+TCP packet.
              * @return Packet ready to transmit; empty on allocation failure.
@@ -4687,11 +4685,15 @@ namespace xtcp {
                 return false;
             }
             const UInt32 seq = snd_nxt_;
-            buf::BufRef packet = BuildSegmentPacket(local_, remote_, seq, rcv_nxt_,
+            buf::BufRef packet;
+            {
+                buf::TxAcquireScope tx_class;
+                packet = BuildSegmentPacket(local_, remote_, seq, rcv_nxt_,
                                                     kFlagAck | kFlagPsh |
                                                         (cwr_pending_ ? kFlagCwr : 0), data, len,
                                                     AdvertisedWindow(), rcv_wscale_,
                                                     Md5Key(), Md5KeyLen(), NULLPTR, 0, NULLPTR, ecn_active_);
+            }
             if (packet.IsEmpty()) {
                 // Pool exhaustion on the direct-send path: buffer instead of
                 // failing, so apps that do fire-and-forget sends never drop
@@ -5254,10 +5256,14 @@ namespace xtcp {
                 const UInt16 data_flags = kFlagAck |
                     ((off + n == data.size()) ? kFlagPsh : 0) |
                     (cwr_pending_ ? kFlagCwr : 0);
-                buf::BufRef packet = BuildSegmentPacket(local_, remote_, seq, rcv_nxt_,
+                buf::BufRef packet;
+                {
+                    buf::TxAcquireScope tx_class;
+                    packet = BuildSegmentPacket(local_, remote_, seq, rcv_nxt_,
                                                         data_flags, data.data() + off, n,
                                                         AdvertisedWindow(), rcv_wscale_,
                                                         Md5Key(), Md5KeyLen(), NULLPTR, 0, NULLPTR, ecn_active_);
+                }
                 if (packet.IsEmpty()) {
                     pending_send_.insert(pending_send_.begin(), data.begin() + off, data.end());
                     return;

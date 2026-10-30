@@ -92,9 +92,21 @@ namespace xtcp {
              * @param count Number of blocks.
              */
             void FlushToGlobal(Byte* const* payloads, UInt32 count) noexcept;
+            /**
+             * @brief Creates a heap-overflow owner for one tier. It has no
+             *        arena: BufRef::Acquire hands out individually heap-
+             *        allocated blocks tagged with this owner when the tier's
+             *        arena is empty, and Release frees them.
+             */
+            static BufPool* NewHeapOverflow(UInt32 block_size) noexcept;
+            /**
+             * @brief True for a heap-overflow owner (see NewHeapOverflow).
+             */
+            bool IsHeapOverflow() const noexcept { return heap_overflow_; }
 
         private:
             Byte*                   arena_       = NULLPTR;
+            bool                    heap_overflow_ = false;  /**< Blocks are individual heap allocations */
             std::atomic<void*>      free_list_   = NULLPTR;
             std::atomic<UInt32>     free_count_  = 0;
             UInt32                  block_size_  = 0;
@@ -222,5 +234,59 @@ namespace xtcp {
          *        returns empty and Release drops blocks.
          */
         void ShutdownPools() noexcept;
+
+        /**
+         * @brief Global packet-memory pressure gate for NEW transmit data
+         *        (kernel tcp_memory_pressure / sk_wmem_schedule analogue).
+         *
+         * The tiered pools are shared by transmit retention (every unACKed
+         * data segment holds its packet block until it is ACKed) and by
+         * ingress (every received packet, including the pure ACKs that
+         * release that retention). Without a split, enough concurrent
+         * senders (flows x snd_buf > pool) consume every block, ingress
+         * can no longer allocate, the ACKs that would free the blocks are
+         * dropped, and the stack wedges permanently.
+         *
+         * Each tier keeps a headroom reserve (1/8 of its blocks) that new
+         * transmit data may not consume. While a TxAcquireScope is alive on
+         * the calling thread, BufRef::Acquire skips tiers at or below their
+         * reserve and never uses the heap overflow; an empty result makes
+         * the caller keep the data buffered (bounded by snd_buf) and retry
+         * once ACKs free blocks. Ingress, ACKs, control segments and
+         * retransmissions run outside the scope and keep using the full
+         * pool plus the bounded heap overflow. When no tier is under
+         * pressure the scope changes nothing. Keep the scope tight around
+         * the packet build: a synchronous sink may process ingress
+         * re-entrantly and that ingress must not be classed as transmit.
+         */
+        class TxAcquireScope {
+        public:
+            TxAcquireScope() noexcept;
+            ~TxAcquireScope() noexcept;
+            TxAcquireScope(const TxAcquireScope&) = delete;
+            TxAcquireScope& operator=(const TxAcquireScope&) = delete;
+        private:
+            bool prev_ = false;
+        };
+
+        /**
+         * @brief Pool-pressure telemetry (process-wide, monotonic counters
+         *        except heap_overflow_bytes, which is the current level).
+         */
+        struct PoolPressureStats {
+            UInt64 tx_deferrals = 0;           /**< TxAcquireScope acquisitions denied at the reserve */
+            UInt64 heap_overflow_acquires = 0; /**< Blocks served from the bounded heap overflow */
+            UInt64 heap_overflow_denials = 0;  /**< Overflow cap reached: Acquire returned empty */
+            UInt64 heap_overflow_bytes = 0;    /**< Heap overflow bytes currently in use */
+            UInt64 heap_overflow_peak = 0;     /**< High-water mark of heap_overflow_bytes */
+        };
+        PoolPressureStats GetPoolPressureStats() noexcept;
+
+        /**
+         * @brief Upper bound of the heap overflow used when every fitting
+         *        tier is empty (last-resort backstop so ingress/ACK
+         *        processing is never starved by a full arena).
+         */
+        constexpr UInt64 kHeapOverflowCapBytes = 8ull * 1024ull * 1024ull;
     }
 }

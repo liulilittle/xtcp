@@ -18,6 +18,23 @@ namespace xtcp {
             // large-GRO tier bounded independently; the small tiers provide
             // enough packet capacity for the configured send-buffer envelope.
             constexpr UInt32 kPoolBlocks[kPoolCount] = { 8192, 4096, 128 };
+            // Transmit headroom: new transmit data may not take a tier below
+            // 1/8 of its blocks (see TxAdmit). The reserve keeps ingress -
+            // above all the pure ACKs that release transmit retention -
+            // allocatable when flows x snd_buf exceeds the arena.
+            constexpr UInt32 kTxReserveShift = 3;
+
+            // Heap overflow owners (one per tier) and the bounded overflow
+            // accounting. Overflow blocks are plain heap allocations tagged
+            // with the tier's overflow owner so BufRef/Release stay unchanged.
+            BufPool* g_heap_pools[kPoolCount] = { NULLPTR, NULLPTR, NULLPTR };
+            std::atomic<UInt64> g_heap_bytes{ 0 };
+            std::atomic<UInt64> g_heap_peak{ 0 };
+            std::atomic<UInt64> g_heap_acquires{ 0 };
+            std::atomic<UInt64> g_heap_denials{ 0 };
+            std::atomic<UInt64> g_tx_deferrals{ 0 };
+            // Set by TxAcquireScope: the current Acquire builds NEW data.
+            thread_local bool t_tx_class = false;
 
             // Pool lifetime: pools are created by InitPools and are NEVER
             // freed by ShutdownPools. A concurrent Acquire/Release running on
@@ -33,9 +50,11 @@ namespace xtcp {
             // re-init.
             struct PoolRegistry {
                 BufPool* pools[kPoolCount] = { NULLPTR, NULLPTR, NULLPTR };
+                BufPool* heap_pools[kPoolCount] = { NULLPTR, NULLPTR, NULLPTR };
                 ~PoolRegistry() noexcept {
                     for (UInt32 i = 0; i < kPoolCount; ++i) {
                         delete pools[i];
+                        delete heap_pools[i];
                     }
                 }
             };
@@ -125,6 +144,9 @@ namespace xtcp {
                     break;
                 }
             }
+            if (0 == block_count_) {
+                return;  // heap-overflow owner: no arena
+            }
             arena_ = static_cast<Byte*>(xtcp::Malloc(static_cast<UInt64>(block_size_) * block_count_));
             if (NULLPTR == arena_) {
                 block_count_ = 0;
@@ -141,8 +163,18 @@ namespace xtcp {
         }
 
         BufPool::~BufPool() noexcept {
-            xtcp::Mfree(arena_);
+            if (NULLPTR != arena_) {
+                xtcp::Mfree(arena_);
+            }
             arena_ = NULLPTR;
+        }
+
+        BufPool* BufPool::NewHeapOverflow(UInt32 block_size) noexcept {
+            BufPool* p = new (std::nothrow) BufPool(block_size, 0);
+            if (NULLPTR != p) {
+                p->heap_overflow_ = true;
+            }
+            return p;
         }
 
         Byte* BufPool::Acquire() noexcept {
@@ -177,6 +209,13 @@ namespace xtcp {
         }
 
         void BufPool::Release(Byte* payload) noexcept {
+            if (heap_overflow_) {
+                // Individually allocated overflow block: free it and return
+                // its bytes to the overflow budget. Never cached per thread.
+                xtcp::Mfree(payload - kHeaderBytes);
+                g_heap_bytes.fetch_sub(block_size_, std::memory_order_relaxed);
+                return;
+            }
             // Fast path: cache locally (lock-free), flush in batches. Only
             // when THIS pool already owns the tier slot - a slot owned by a
             // different pool holds that pool's blocks, and caching ours
@@ -245,19 +284,87 @@ namespace xtcp {
         }
 
         BufRef BufRef::Acquire(UInt32 min_size) noexcept {
+            const bool tx_class = t_tx_class;
             for (UInt32 i = 0; i < kPoolCount; ++i) {
                 BufPool* pool = g_pools[i];
                 if (NULLPTR == pool) {
                     continue;
                 }
                 if ((pool->BlockSize() - kHeaderBytes) >= min_size) {
+                    // New transmit data may not dip into the tier's ingress
+                    // headroom (TxAcquireScope). The global free count
+                    // ignores per-thread caches, so this errs toward
+                    // keeping more headroom, never less.
+                    if (tx_class && pool->FreeCount() <= (pool->Capacity() >> kTxReserveShift)) {
+                        continue;
+                    }
                     Byte* payload = pool->Acquire();
                     if (NULLPTR != payload) {
                         return AcquireFrom(*pool, payload);
                     }
                 }
             }
+            if (tx_class) {
+                // Transmit data never uses the heap overflow: it stays
+                // buffered (bounded by snd_buf) until ACKs free blocks.
+                g_tx_deferrals.fetch_add(1, std::memory_order_relaxed);
+                return BufRef();
+            }
+            // Every fitting tier is empty: serve the smallest fitting size
+            // class from the bounded heap overflow so ingress and control
+            // traffic keep flowing under pool pressure. New transmit data
+            // never gets here (see above), so the overflow is ingress,
+            // ACK and retransmission headroom only.
+            for (UInt32 i = 0; i < kPoolCount; ++i) {
+                BufPool* heap = g_heap_pools[i];
+                BufPool* pool = g_pools[i];
+                if (NULLPTR == heap || NULLPTR == pool || pool->IsDestroyed()) {
+                    continue;
+                }
+                const UInt32 block = heap->BlockSize();
+                if ((block - kHeaderBytes) < min_size) {
+                    continue;
+                }
+                const UInt64 prev = g_heap_bytes.fetch_add(block, std::memory_order_relaxed);
+                if (prev + block > kHeapOverflowCapBytes) {
+                    g_heap_bytes.fetch_sub(block, std::memory_order_relaxed);
+                    g_heap_denials.fetch_add(1, std::memory_order_relaxed);
+                    return BufRef();
+                }
+                Byte* raw = static_cast<Byte*>(xtcp::Malloc(block));
+                if (NULLPTR == raw) {
+                    g_heap_bytes.fetch_sub(block, std::memory_order_relaxed);
+                    g_heap_denials.fetch_add(1, std::memory_order_relaxed);
+                    return BufRef();
+                }
+                UInt64 peak = g_heap_peak.load(std::memory_order_relaxed);
+                while (prev + block > peak &&
+                       !g_heap_peak.compare_exchange_weak(peak, prev + block, std::memory_order_relaxed)) {
+                }
+                g_heap_acquires.fetch_add(1, std::memory_order_relaxed);
+                *reinterpret_cast<BufPool**>(raw) = heap;
+                *reinterpret_cast<std::atomic<UInt32>*>(raw + sizeof(void*)) = 1;
+                return AcquireFrom(*heap, raw + kHeaderBytes);
+            }
             return BufRef();
+        }
+
+        TxAcquireScope::TxAcquireScope() noexcept : prev_(t_tx_class) {
+            t_tx_class = true;
+        }
+
+        TxAcquireScope::~TxAcquireScope() noexcept {
+            t_tx_class = prev_;
+        }
+
+        PoolPressureStats GetPoolPressureStats() noexcept {
+            PoolPressureStats s;
+            s.tx_deferrals = g_tx_deferrals.load(std::memory_order_relaxed);
+            s.heap_overflow_acquires = g_heap_acquires.load(std::memory_order_relaxed);
+            s.heap_overflow_denials = g_heap_denials.load(std::memory_order_relaxed);
+            s.heap_overflow_bytes = g_heap_bytes.load(std::memory_order_relaxed);
+            s.heap_overflow_peak = g_heap_peak.load(std::memory_order_relaxed);
+            return s;
         }
 
         BufRef BufRef::AcquireFrom(BufPool& pool, Byte* payload) noexcept {
@@ -309,6 +416,11 @@ namespace xtcp {
                     BufPool* p = new (std::nothrow) BufPool(kPoolSizes[i], kPoolBlocks[i]);
                     g_pools[i] = p;
                     g_registry.pools[i] = p;
+                    if (NULLPTR == g_heap_pools[i]) {
+                        BufPool* h = BufPool::NewHeapOverflow(kPoolSizes[i]);
+                        g_heap_pools[i] = h;
+                        g_registry.heap_pools[i] = h;
+                    }
                 } else if (g_pools[i]->IsDestroyed()) {
                     // Re-init after ShutdownPools: re-arm the same pool
                     // (its arena is still allocated - the registry frees it

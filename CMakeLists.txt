@@ -347,6 +347,7 @@ if(XTCP_BUILD_TESTS)
         test_qdisc_rate_bridge
         test_qdisc_remove_flow
         test_qdisc_batch
+        test_pool_pressure
     )
     if(UNIX AND NOT APPLE)
         list(APPEND XTCP_TESTS test_interop_linux)
