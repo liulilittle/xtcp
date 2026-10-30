@@ -23,6 +23,10 @@ namespace xtcp {
             // above all the pure ACKs that release transmit retention -
             // allocatable when flows x snd_buf exceeds the arena.
             constexpr UInt32 kTxReserveShift = 3;
+            constexpr UInt32 kTxFairBurstPackets = 32;
+            // Age repeated allocation failures, not brief ACK-clock pressure.
+            // Forcing every sender into FIFO fragments otherwise healthy GSO.
+            constexpr UInt32 kTxFairWaitDenials = 256;
 
             // Heap overflow owners (one per tier) and the bounded overflow
             // accounting. Overflow blocks are plain heap allocations tagged
@@ -35,6 +39,11 @@ namespace xtcp {
             std::atomic<UInt64> g_tx_deferrals{ 0 };
             // Set by TxAcquireScope: the current Acquire builds NEW data.
             thread_local bool t_tx_class = false;
+            thread_local TxWaiter* t_tx_waiter = NULLPTR;
+            std::mutex g_tx_wait_mutex;
+            TxWaiter* g_tx_wait_head = NULLPTR;
+            TxWaiter* g_tx_wait_tail = NULLPTR;
+            std::atomic<UInt32> g_tx_wait_count{0};
 
             // Pool lifetime: pools are created by InitPools and are NEVER
             // freed by ShutdownPools. A concurrent Acquire/Release running on
@@ -283,8 +292,7 @@ namespace xtcp {
             Unref();  // shared handles must not release the block until zero
         }
 
-        BufRef BufRef::Acquire(UInt32 min_size) noexcept {
-            const bool tx_class = t_tx_class;
+        Byte* BufRef::AcquireArena(UInt32 min_size, bool tx_class, BufPool*& selected) noexcept {
             for (UInt32 i = 0; i < kPoolCount; ++i) {
                 BufPool* pool = g_pools[i];
                 if (NULLPTR == pool) {
@@ -300,11 +308,98 @@ namespace xtcp {
                     }
                     Byte* payload = pool->Acquire();
                     if (NULLPTR != payload) {
-                        return AcquireFrom(*pool, payload);
+                        selected = pool;
+                        return payload;
                     }
                 }
             }
+            return NULLPTR;
+        }
+
+        BufRef BufRef::Acquire(UInt32 min_size) noexcept {
+            const bool tx_class = t_tx_class;
+            TxWaiter* waiter = tx_class ? t_tx_waiter : NULLPTR;
+            if (NULLPTR != waiter && waiter->granted_.load(std::memory_order_acquire)) {
+                BufRef ref = waiter->TakeGrant(min_size);
+                if (!ref.IsEmpty()) return ref;
+            }
+            if (NULLPTR != waiter &&
+                (waiter->active_.load(std::memory_order_acquire) ||
+                 0 != g_tx_wait_count.load(std::memory_order_acquire))) {
+                std::lock_guard<std::mutex> lock(g_tx_wait_mutex);
+                if (waiter->granted_.load(std::memory_order_relaxed)) {
+                    BufRef ref = waiter->TakeGrant(min_size);
+                    if (!ref.IsEmpty()) return ref;
+                }
+                waiter->active_.store(waiter->queued_, std::memory_order_release);
+                if (waiter->queued_) waiter->size_ = min_size;
+                const auto available_payload = []() noexcept {
+                    UInt32 largest = 0;
+                    for (UInt32 i = 0; i < kPoolCount; ++i) {
+                        const BufPool* pool = g_pools[i];
+                        if (NULLPTR != pool && !pool->IsDestroyed() &&
+                            pool->FreeCount() > (pool->Capacity() >> kTxReserveShift)) {
+                            largest = pool->BlockSize() - kHeaderBytes;
+                        }
+                    }
+                    return largest;
+                };
+                UInt32 available = available_payload();
+                // Reserve a bounded burst for each older eligible waiter before
+                // allowing an ACK-driven sender to refill. Skip size classes
+                // that cannot allocate, so a 32K waiter cannot block MSS TX.
+                for (TxWaiter* current = g_tx_wait_head; NULLPTR != current && available != 0;) {
+                    TxWaiter* next = current->next_;
+                    if (current->size_ <= available) {
+                        BufPool* selected = NULLPTR;
+                        Byte* payload = AcquireArena(current->size_, true, selected);
+                        if (NULLPTR != payload) {
+                            current->UnlinkNoLock();
+                            current->ready_ = AcquireFrom(*selected, payload);
+                            while (current->extra_ && current->extra_count_ < kTxFairBurstPackets - 1) {
+                                payload = AcquireArena(current->size_, true, selected);
+                                if (NULLPTR == payload) break;
+                                current->extra_[current->extra_count_++] = AcquireFrom(*selected, payload);
+                            }
+                            // Unlinked entries now belong exclusively to their
+                            // connection. Publish the complete burst once.
+                            current->granted_.store(true, std::memory_order_release);
+                        }
+                        available = available_payload();
+                    }
+                    current = next;
+                }
+                if (waiter->granted_.load(std::memory_order_relaxed)) {
+                    BufRef ref = waiter->TakeGrant(min_size);
+                    if (!ref.IsEmpty()) return ref;
+                }
+                if (!waiter->queued_) {
+                    BufPool* selected = NULLPTR;
+                    Byte* payload = AcquireArena(min_size, true, selected);
+                    if (NULLPTR != payload) {
+                        waiter->denials_ = 0;
+                        return AcquireFrom(*selected, payload);
+                    }
+                    if (waiter->denials_ < kTxFairWaitDenials) ++waiter->denials_;
+                    if (waiter->denials_ == kTxFairWaitDenials) waiter->EnqueueNoLock(min_size);
+                }
+                g_tx_deferrals.fetch_add(1, std::memory_order_relaxed);
+                return BufRef();
+            }
+            BufPool* selected = NULLPTR;
+            Byte* payload = AcquireArena(min_size, tx_class, selected);
+            if (NULLPTR != payload) {
+                if (NULLPTR != waiter) waiter->denials_ = 0;
+                return AcquireFrom(*selected, payload);
+            }
             if (tx_class) {
+                if (NULLPTR != waiter) {
+                    if (waiter->denials_ < kTxFairWaitDenials) ++waiter->denials_;
+                    if (waiter->denials_ == kTxFairWaitDenials) {
+                        std::lock_guard<std::mutex> lock(g_tx_wait_mutex);
+                        waiter->EnqueueNoLock(min_size);
+                    }
+                }
                 // Transmit data never uses the heap overflow: it stays
                 // buffered (bounded by snd_buf) until ACKs free blocks.
                 g_tx_deferrals.fetch_add(1, std::memory_order_relaxed);
@@ -349,12 +444,84 @@ namespace xtcp {
             return BufRef();
         }
 
-        TxAcquireScope::TxAcquireScope() noexcept : prev_(t_tx_class) {
+        BufRef TxWaiter::TakeGrant(UInt32 size) noexcept {
+            // Called only after acquiring a published grant; Acquire/Cancel
+            // on this connection are serialized by its owner, not this mutex.
+            BufRef result;
+            while (extra_count_ > 0) {
+                BufRef& ref = extra_[--extra_count_];
+                if (ref.Capacity() >= size) {
+                    result = std::move(ref);
+                    break;
+                }
+                ref = BufRef();
+            }
+            if (result.IsEmpty() && !ready_.IsEmpty()) {
+                if (ready_.Capacity() >= size) result = std::move(ready_);
+                else ready_ = BufRef();
+            }
+            const bool held = extra_count_ > 0 || !ready_.IsEmpty();
+            granted_.store(held, std::memory_order_release);
+            active_.store(held, std::memory_order_release);
+            if (!result.IsEmpty()) denials_ = 0;
+            return result;
+        }
+
+        void TxWaiter::EnqueueNoLock(UInt32 size) noexcept {
+            size_ = size;
+            if (queued_) return;
+            if (!extra_) extra_.reset(new (std::nothrow) BufRef[kTxFairBurstPackets - 1]);
+            prev_ = g_tx_wait_tail;
+            if (NULLPTR != prev_) prev_->next_ = this;
+            else g_tx_wait_head = this;
+            g_tx_wait_tail = this;
+            queued_ = true;
+            active_.store(true, std::memory_order_release);
+            g_tx_wait_count.fetch_add(1, std::memory_order_release);
+        }
+
+        void TxWaiter::UnlinkNoLock() noexcept {
+            if (!queued_) return;
+            if (NULLPTR != prev_) prev_->next_ = next_;
+            else g_tx_wait_head = next_;
+            if (NULLPTR != next_) next_->prev_ = prev_;
+            else g_tx_wait_tail = prev_;
+            prev_ = next_ = NULLPTR;
+            queued_ = false;
+            g_tx_wait_count.fetch_sub(1, std::memory_order_release);
+        }
+
+        void TxWaiter::Cancel() noexcept {
+            denials_ = 0;
+            if (!active_.load(std::memory_order_acquire)) return;
+            std::lock_guard<std::mutex> lock(g_tx_wait_mutex);
+            UnlinkNoLock();
+            while (extra_count_ > 0) extra_[--extra_count_] = BufRef();
+            ready_ = BufRef();
+            granted_.store(false, std::memory_order_release);
+            active_.store(false, std::memory_order_release);
+        }
+
+        void TxWaiter::ReleaseUnused() noexcept {
+            if (!active_.load(std::memory_order_acquire)) return;
+            std::lock_guard<std::mutex> lock(g_tx_wait_mutex);
+            while (extra_count_ > 0) extra_[--extra_count_] = BufRef();
+            // Keep one protected packet and the FIFO turn across pacing/window stops.
+            granted_.store(!ready_.IsEmpty(), std::memory_order_release);
+            active_.store(queued_ || !ready_.IsEmpty(), std::memory_order_release);
+        }
+
+        TxWaiter::~TxWaiter() noexcept { Cancel(); }
+
+        TxAcquireScope::TxAcquireScope(TxWaiter* waiter) noexcept
+            : prev_(t_tx_class), prev_waiter_(t_tx_waiter) {
             t_tx_class = true;
+            t_tx_waiter = waiter;
         }
 
         TxAcquireScope::~TxAcquireScope() noexcept {
             t_tx_class = prev_;
+            t_tx_waiter = prev_waiter_;
         }
 
         PoolPressureStats GetPoolPressureStats() noexcept {

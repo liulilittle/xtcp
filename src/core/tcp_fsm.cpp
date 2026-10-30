@@ -958,6 +958,19 @@ namespace xtcp {
             }
         }
 
+        void TcpConn::MarkPoolLimited(UInt32 inflight) noexcept {
+            // Brief pressure with an active ACK clock still yields useful
+            // path samples. Only a drained pipe or an aged waiter is limited.
+            if (0 != inflight && !tx_waiter_.IsWaiting()) return;
+            // Waiting for local TX memory does not measure path bandwidth.
+            // Existing segments keep their send-time sampling flags; newly
+            // emitted segments carry the local-resource limitation marker.
+            const UInt32 packets = peer_mss_ > 0
+                ? (inflight + peer_mss_ - 1) / peer_mss_ : inflight;
+            const UInt32 marker = static_cast<UInt32>(cc_.delivered_pkts + packets);
+            cc_.app_limited = (0 != marker) ? marker : 1u;
+        }
+
         void TcpConn::ClearAppLimitedMarker() noexcept {
             // Kernel tcp_rate_gen (tcp_rate_66.c:123-125):
             //   if (tp->app_limited && after(tp->delivered, tp->app_limited))
@@ -1053,6 +1066,7 @@ namespace xtcp {
             // Closing states must keep being swept: the reclamation pass in
             // PollAckTimers reads state/deadline before the dirty fast path.
             if (TcpState::kClosed == next || TcpState::kTimeWait == next) {
+                tx_waiter_.Cancel();
                 timers_dirty_.store(true, std::memory_order_relaxed);
             }
             // Bug(close): a closed connection must stop sending. Reaching
@@ -4687,7 +4701,7 @@ namespace xtcp {
             const UInt32 seq = snd_nxt_;
             buf::BufRef packet;
             {
-                buf::TxAcquireScope tx_class;
+                buf::TxAcquireScope tx_class(&tx_waiter_);
                 packet = BuildSegmentPacket(local_, remote_, seq, rcv_nxt_,
                                                     kFlagAck | kFlagPsh |
                                                         (cwr_pending_ ? kFlagCwr : 0), data, len,
@@ -4704,10 +4718,12 @@ namespace xtcp {
                 // buffer as the window frees and re-queues on repeated
                 // exhaustion (FlushPendingSend packet.IsEmpty()). cwr_pending_
                 // stays set so the flush still emits the CWR.
+                MarkPoolLimited(inflight);
                 pending_send_.insert(pending_send_.end(), data, data + len);
                 timers_dirty_.store(true, std::memory_order_relaxed);
                 return true;
             }
+            tx_waiter_.Cancel();
             cwr_pending_ = false;  // CWR emitted on this data segment (RFC 3168 s6.1.2)
             // Kernel CA_EVENT_TX_START gate: tcp_packets_in_flight == 0
             // (tcp_output_v66.c:167-168), evaluated at the emit point.
@@ -5157,8 +5173,13 @@ namespace xtcp {
 
         void TcpConn::FlushPendingSend(TimePoint now) noexcept {
             if (pending_send_.empty() || (TcpState::kEstablished != state_ && TcpState::kCloseWait != state_)) {
+                tx_waiter_.Cancel();
                 return;
             }
+            struct BurstGuard {
+                buf::TxWaiter& waiter;
+                ~BurstGuard() noexcept { waiter.ReleaseUnused(); }
+            } burst_guard{tx_waiter_};
             std::vector<Byte> data;
             data.swap(pending_send_);
             for (UInt32 off = 0; off < data.size();) {
@@ -5258,13 +5279,14 @@ namespace xtcp {
                     (cwr_pending_ ? kFlagCwr : 0);
                 buf::BufRef packet;
                 {
-                    buf::TxAcquireScope tx_class;
+                    buf::TxAcquireScope tx_class(&tx_waiter_);
                     packet = BuildSegmentPacket(local_, remote_, seq, rcv_nxt_,
                                                         data_flags, data.data() + off, n,
                                                         AdvertisedWindow(), rcv_wscale_,
                                                         Md5Key(), Md5KeyLen(), NULLPTR, 0, NULLPTR, ecn_active_);
                 }
                 if (packet.IsEmpty()) {
+                    MarkPoolLimited(inflight);
                     pending_send_.insert(pending_send_.begin(), data.begin() + off, data.end());
                     return;
                 }
@@ -5319,6 +5341,7 @@ namespace xtcp {
             // Bug(close): when Close() deferred the FIN because buffered data
             // was window-constrained, this drain is what unlocks it - the FIN
             // must follow every data byte on the wire (RFC 793).
+            if (pending_send_.empty()) tx_waiter_.Cancel();
             MaybeFinishClose(now);
         }
 

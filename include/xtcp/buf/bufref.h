@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <memory>
 
 namespace xtcp {
     namespace buf {
@@ -211,6 +212,7 @@ namespace xtcp {
 
         private:
             static BufRef AcquireFrom(BufPool& pool, Byte* payload) noexcept;
+            static Byte* AcquireArena(UInt32 min_size, bool tx_class, BufPool*& selected) noexcept;
             void Release() noexcept;
 
             BufPool*    pool_     = NULLPTR;
@@ -234,6 +236,35 @@ namespace xtcp {
          *        returns empty and Release drops blocks.
          */
         void ShutdownPools() noexcept;
+
+        // A bounded arena burst protects a persistently denied sender.
+        // The connection serializes Acquire/Cancel. Queue/grant publication
+        // uses the global mutex; a published grant belongs only to its owner.
+        class TxWaiter {
+        public:
+            TxWaiter() noexcept = default;
+            ~TxWaiter() noexcept;
+            void Cancel() noexcept;
+            void ReleaseUnused() noexcept;
+            bool IsWaiting() const noexcept { return active_.load(std::memory_order_acquire); }
+            TxWaiter(const TxWaiter&) = delete;
+            TxWaiter& operator=(const TxWaiter&) = delete;
+        private:
+            friend class BufRef;
+            void EnqueueNoLock(UInt32 size) noexcept;
+            void UnlinkNoLock() noexcept;
+            BufRef TakeGrant(UInt32 size) noexcept;
+            std::atomic<bool> active_{false};
+            std::atomic<bool> granted_{false};
+            bool queued_ = false;
+            UInt32 size_ = 0;
+            UInt32 denials_ = 0;
+            TxWaiter* prev_ = NULLPTR;
+            TxWaiter* next_ = NULLPTR;
+            BufRef ready_;
+            std::unique_ptr<BufRef[]> extra_;
+            UInt32 extra_count_ = 0;
+        };
 
         /**
          * @brief Global packet-memory pressure gate for NEW transmit data
@@ -261,12 +292,13 @@ namespace xtcp {
          */
         class TxAcquireScope {
         public:
-            TxAcquireScope() noexcept;
+            explicit TxAcquireScope(TxWaiter* waiter = NULLPTR) noexcept;
             ~TxAcquireScope() noexcept;
             TxAcquireScope(const TxAcquireScope&) = delete;
             TxAcquireScope& operator=(const TxAcquireScope&) = delete;
         private:
             bool prev_ = false;
+            TxWaiter* prev_waiter_ = NULLPTR;
         };
 
         /**

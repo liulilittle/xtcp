@@ -1155,6 +1155,7 @@ namespace xtcp {
              *        marker is cleared only when delivered passes it).
              */
             void MaybeMarkAppLimited(UInt32 inflight, TimePoint now) noexcept;
+            void MarkPoolLimited(UInt32 inflight) noexcept;
             /**
              * @brief Kernel tcp_rate_gen's app-limited clear
              *        (tcp_rate_66.c:123-125): runs on EVERY ACK, cumulative
@@ -1418,6 +1419,7 @@ namespace xtcp {
             Byte        batch_app_limited_ = 0;     /**< app-limited snapshot of the newest popped segment */
             bool        batch_retrans_ = false;     /**< any segment popped by the CURRENT ACK was retransmitted */
             bool        last_ack_delayed_ = false;  /**< current ACK looks like a delayed ACK (kernel flag) */
+            buf::TxWaiter tx_waiter_;
         };
 
         /**
