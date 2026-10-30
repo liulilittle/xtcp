@@ -64,6 +64,9 @@ namespace xtcp {
             constexpr UInt32 kDefaultWindow = 65535;
             constexpr UInt32 kMaxDataRetries = 15;  // Linux tcp_retries2 equivalent
             constexpr UInt32 kDelayedAckMs = 40;  // RFC 1122 delayed-ACK timer
+            // MSS carried in our SYN/SYN+ACK MSS option (0x05B4); the upper
+            // bound of the kernel's icsk_ack.rcv_mss estimate (advmss).
+            constexpr UInt32 kAdvertisedMss = 1460;
             // RFC 7323 s5.5: after this much idle time (24 days) the peer's
             // millisecond clock may have wrapped - the PAWS check is relaxed
             // (the sequence-number checks still bound the segment). Linux:
@@ -6542,7 +6545,16 @@ namespace xtcp {
                         } else {
                             ack_pending_ = true;
                             ++ack_count_;
-                            if (2 <= ack_count_) { SendSegment(snd_nxt_, rcv_nxt_, AckFlags(), NULLPTR, 0);
+                            // Linux __tcp_ack_snd_check: ACK at once when
+                            // more than one full-sized segment (rcv_mss) is
+                            // unacknowledged - BYTES, not segment count. A
+                            // GRO/LRO super-segment covering several MSS
+                            // arrives as ONE segment and must not wait for
+                            // the 40 ms delayed-ACK timer. rcv_mss is bounded
+                            // by our advertised MSS (kAdvertisedMss, the SYN
+                            // MSS option), so "payload > advertised MSS"
+                            // implies "more than one full-sized segment".
+                            if (2 <= ack_count_ || payload_len > kAdvertisedMss) { SendSegment(snd_nxt_, rcv_nxt_, AckFlags(), NULLPTR, 0);
                                 ack_pending_ = false;
                                 ack_count_ = 0;
                                 ack_deadline_ = 0;

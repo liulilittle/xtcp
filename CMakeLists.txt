@@ -240,6 +240,7 @@ if(XTCP_BUILD_TESTS)
         test_mss_zero
         test_ecn_bidi
         test_ecn_cc
+        test_rcv_mss_ack
         test_ecn_cwr
         test_retries_cap
         test_window_sndwl
